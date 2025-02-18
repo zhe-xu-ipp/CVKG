@@ -1,5 +1,5 @@
 """
-reuse code from github repo: https://github.com/jingyaogong/minimind-v
+borrow from github repo: https://github.com/jingyaogong/minimind-v
 
 """
 
