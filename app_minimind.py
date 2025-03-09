@@ -12,15 +12,22 @@ from typing import List
 import openai
 import requests
 from graphviz import Digraph
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from model.model_vlm import MiniMindVLM
+from model.VLMConfig import VLMConfig
+import torch
+import io
+from PIL import Image
 
 # ========== 1. 初始化环境 ==========
+os.environ["OPENAI_API_KEY"] = ""
 openai.api_key = os.environ["OPENAI_API_KEY"]
 
 # 创建新版 OpenAI 客户端对象（如果你需要 GPT-4o）
 client = openai.OpenAI()
 
 # 如果你想把图片上传到 imgbb 获取外网URL，可以使用此API key（可选）
-# imgbb_api_key = "8baf49af7dbcbcb4232b753a90d2f41b"
+imgbb_api_key = "8baf49af7dbcbcb4232b753a90d2f41b"
 
 # ========== 2. 定义知识图谱数据结构 (Pydantic) ==========
 class Node(BaseModel):
@@ -72,55 +79,96 @@ def clean_kg_text(text: str) -> str:
     text = text.replace("，", ",").replace("：", ":")
     return text
 
-def upload_image_to_imgbb(image_bytes: bytes) -> str:
-    """
-    如果你想把图片上传到 imgbb 以获取外网URL，可调用此函数。
-    这里在 generate_caption 中暂未使用。
-    """
-    url = "https://api.imgbb.com/1/upload"
-    payload = {
-        "key": imgbb_api_key,
-        "image": base64.b64encode(image_bytes).decode('utf-8'),
-        "name": "uploaded_image"
-    }
-    response = requests.post(url, data=payload)
-    data = response.json()
-    if data.get("success"):
-        image_url = data["data"]["url"]
-        return image_url
-    else:
-        raise Exception("图片上传失败: " + str(data.get("error", {}).get("message", "")))
+# def upload_image_to_imgbb(image_bytes: bytes) -> str:
+#     """
+#     如果你想把图片上传到 imgbb 以获取外网URL，可调用此函数。
+#     这里在 generate_caption 中暂未使用。
+#     """
+#     url = "https://api.imgbb.com/1/upload"
+#     payload = {
+#         "key": imgbb_api_key,
+#         "image": base64.b64encode(image_bytes).decode('utf-8'),
+#         "name": "uploaded_image"
+#     }
+#     response = requests.post(url, data=payload)
+#     data = response.json()
+#     if data.get("success"):
+#         image_url = data["data"]["url"]
+#         return image_url
+#     else:
+#         raise Exception("图片上传失败: " + str(data.get("error", {}).get("message", "")))
+
+
+def init_model(model_path="./out/sft_vlm_512.pth" ,device='cuda'):
+    
+    transformers_model_path = 'jingyaogong/MiniMind2-V'
+    tokenizer = AutoTokenizer.from_pretrained(transformers_model_path)
+    model = AutoModelForCausalLM.from_pretrained(transformers_model_path, trust_remote_code=True)
+    # model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
+    # print(f'VLM参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
+    vision_model, preprocess = MiniMindVLM.get_vision_model()
+    return model.eval().to(device), tokenizer, vision_model.eval().to(device), preprocess
 
 # ========== 5. 核心逻辑：生成图片描述、生成知识图谱 ==========
 
-def generate_caption(image_bytes: bytes) -> str:
+def generate_caption(image_bytes: bytes, model, tokenizer, preprocess) -> str:
     """
     调用 GPT-4o 的接口生成图片描述。
     注意：这里假设 GPT-4o 支持直接传入 base64 的 data URL，
           具体要看你的接口权限和调用方式。
     """
-    base64_image = base64.b64encode(image_bytes).decode('utf-8')
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "用中文详细描述图片中的所有物体及其空间关系。"},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}", "detail": "high"}}
-            ]
-        }
-    ]
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",  # 根据你的模型名称替换
-            messages=messages,
-            max_tokens=1000,
+    # base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    image = Image.open(io.BytesIO(image_bytes))
+    device = model.device
+    # messages = [
+    #     {
+    #         "role": "user",
+    #         "content": [
+    #             {"type": "text", "text": "详细具体地描述图片中的所有元素及其他们之间的空间关系。空间关系包括但不限于：位置、大小、颜色、数量、动作等。"},
+    #             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}", "detail": "high"}}
+    #         ]
+    #     }
+    # ]
+
+    prompt = f"{model.params.image_special_token}详细具体地描述图片中的所有元素及其他们之间的空间关系。空间关系包括但不限于：位置、大小、颜色、数量、动作等。"
+
+    messages = [{"role": "user", "content": prompt}]
+
+    new_prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )[-1000:]
+
+    with torch.no_grad():
+        x = torch.tensor(tokenizer(new_prompt)['input_ids'], device=device).unsqueeze(0)
+        pixel_tensors = MiniMindVLM.image2tensor(image, preprocess).to(device).unsqueeze(0)
+        outputs = model.generate(
+            x,
+            eos_token_id=tokenizer.eos_token_id,
+            # max_new_tokens=args.max_seq_len,
+            # temperature=args.temperature,
+            # top_p=args.top_p,
+            pad_token_id=tokenizer.pad_token_id,
+            pixel_tensors=pixel_tensors
         )
-        caption = response.choices[0].message.content
-        print("图片描述生成结果：", caption)
-        return caption
-    except Exception as e:
-        print(f"OpenAI API 错误: {e}")
-        return fallback_caption
+        
+        return tokenizer.decode(outputs.squeeze()[x.shape[1]:].tolist(), skip_special_tokens=True)
+
+            
+
+    # try:
+    #     response = client.chat.completions.create(
+    #         model="gpt-4o",  # 根据你的模型名称替换
+    #         messages=messages,
+    #         max_tokens=1000,
+    #     )
+    #     caption = response.choices[0].message.content
+    #     print("图片描述生成结果：", caption)
+    #     return caption
+    # except Exception as e:
+    #     print(f"OpenAI API 错误: {e}")
+    #     return fallback_caption
 
 def generate_kg(text: str) -> dict:
     """
@@ -191,6 +239,7 @@ def ImageToKnowledgeGraph():
     kg_result = solara.use_reactive(None)
     error_message = solara.use_reactive("")
     debug_message = solara.use_reactive("")
+    model, tokenizer, vision_model, preprocess = init_model()
 
     def process_pipeline():
         debug_info = ""
@@ -204,7 +253,7 @@ def ImageToKnowledgeGraph():
         debug_info += "开始处理流程。\n"
         try:
             # 1) 生成图片描述
-            caption = generate_caption(uploaded_image.value)
+            caption = generate_caption(uploaded_image.value, model, tokenizer, preprocess)
             if not caption or len(caption.strip()) < 20:
                 debug_info += "生成的图片描述较短，使用备用描述。\n"
                 caption = fallback_caption
@@ -279,4 +328,9 @@ def Page():
     solara.Markdown("上传图片后，系统将先通过视觉模型生成图片描述，再根据描述生成知识图谱。")
     ImageToKnowledgeGraph()
 
-Page()
+
+def main():
+    Page()
+
+if __name__ == "__main__":
+    main()

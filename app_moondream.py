@@ -1,3 +1,15 @@
+
+
+vipshome = 'c:\\vips\\bin'
+
+# set PATH
+import os
+os.environ['PATH'] = vipshome + ';' + os.environ['PATH']
+
+# and now pyvips will pick up the DLLs in the vips area
+import pyvips
+
+
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv())
 
@@ -12,15 +24,25 @@ from typing import List
 import openai
 import requests
 from graphviz import Digraph
+from transformers import AutoTokenizer, AutoModelForCausalLM
+# from model.model_vlm import MiniMindVLM
+# from model.VLMConfig import VLMConfig
+import torch
+import io
+from PIL import Image
+
 
 # ========== 1. 初始化环境 ==========
+os.environ["OPENAI_API_KEY"] = ""
 openai.api_key = os.environ["OPENAI_API_KEY"]
 
 # 创建新版 OpenAI 客户端对象（如果你需要 GPT-4o）
 client = openai.OpenAI()
 
 # 如果你想把图片上传到 imgbb 获取外网URL，可以使用此API key（可选）
-# imgbb_api_key = "8baf49af7dbcbcb4232b753a90d2f41b"
+imgbb_api_key = "8baf49af7dbcbcb4232b753a90d2f41b"
+
+
 
 # ========== 2. 定义知识图谱数据结构 (Pydantic) ==========
 class Node(BaseModel):
@@ -37,21 +59,6 @@ class Edge(BaseModel):
 class KnowledgeGraph(BaseModel):
     nodes: List[Node] = Field(description="Nodes in the knowledge graph")
     edges: List[Edge] = Field(description="Edges in the knowledge graph")
-
-# ========== 3. 备用描述 (当 GPT-4o 返回的描述不够详细时) ==========
-fallback_caption = (
-    "这张图片展示了一片公园景色，画面主要由以下元素构成：\n\n"
-    "草地：\n\n"
-    "画面大部分区域被绿色的草坪覆盖，草地整洁且富有生机。阳光洒在草地上，部分区域受到树木的阴影遮挡，形成明暗对比。\n\n"
-    "紫色和白色的花：\n\n"
-    "主要集中在前景区域，一簇簇盛开的紫色和白色花朵散布在草地上，增添了视觉层次感。\n\n"
-    "高大的落叶树木：\n\n"
-    "中后方有几棵高大树木，树干粗壮，枝条伸展，并投射出阴影。\n\n"
-    "远处的建筑：\n\n"
-    "背景中有一座欧式风格的建筑，部分被树木遮挡，暗示着公园与城市环境的融合。\n\n"
-    "天空：\n\n"
-    "天空清澈蓝色，没有明显云层，整体画面透露出春天来临、宁静且充满生机的氛围。"
-)
 
 # ========== 4. 工具函数 ==========
 
@@ -72,60 +79,26 @@ def clean_kg_text(text: str) -> str:
     text = text.replace("，", ",").replace("：", ":")
     return text
 
-def upload_image_to_imgbb(image_bytes: bytes) -> str:
-    """
-    如果你想把图片上传到 imgbb 以获取外网URL，可调用此函数。
-    这里在 generate_caption 中暂未使用。
-    """
-    url = "https://api.imgbb.com/1/upload"
-    payload = {
-        "key": imgbb_api_key,
-        "image": base64.b64encode(image_bytes).decode('utf-8'),
-        "name": "uploaded_image"
-    }
-    response = requests.post(url, data=payload)
-    data = response.json()
-    if data.get("success"):
-        image_url = data["data"]["url"]
-        return image_url
-    else:
-        raise Exception("图片上传失败: " + str(data.get("error", {}).get("message", "")))
-
 # ========== 5. 核心逻辑：生成图片描述、生成知识图谱 ==========
 
-def generate_caption(image_bytes: bytes) -> str:
-    """
-    调用 GPT-4o 的接口生成图片描述。
-    注意：这里假设 GPT-4o 支持直接传入 base64 的 data URL，
-          具体要看你的接口权限和调用方式。
-    """
-    base64_image = base64.b64encode(image_bytes).decode('utf-8')
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "用中文详细描述图片中的所有物体及其空间关系。"},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}", "detail": "high"}}
-            ]
-        }
-    ]
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",  # 根据你的模型名称替换
-            messages=messages,
-            max_tokens=1000,
-        )
-        caption = response.choices[0].message.content
-        print("图片描述生成结果：", caption)
-        return caption
-    except Exception as e:
-        print(f"OpenAI API 错误: {e}")
-        return fallback_caption
+def generate_caption(image_bytes: bytes, model) -> str:
+    # base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    print("开始处理图片。")
+    image = Image.open(io.BytesIO(image_bytes))
+    image = image.convert("RGB")
+    print("图片处理完毕。")
+    enc_image = model.encode_image(image)
+    print("图片编码完毕。")
+    output = model.query(enc_image, "Describe the objects in the image and their relationships, including positions, actions, and attributes.")['answer']
+    print("query完毕。")
+
+    return output
 
 def generate_kg(text: str) -> dict:
     """
     调用 GPT-4o 根据文本生成知识图谱的 Python 字典格式。
     """
+    print(text)
     messages = [
         {
             "role": "user",
@@ -176,6 +149,19 @@ def ImageUpload():
     uploader.observe(on_upload_change, names="value")
     return uploader, uploaded_image
 
+
+@solara.memoize
+def load_model():
+    print("正在加载 Moondream2 模型...")
+    model = AutoModelForCausalLM.from_pretrained(
+        "vikhyatk/moondream2",
+        revision="2025-01-09",
+        trust_remote_code=True,
+        device_map={"": "cuda"}  # 确保 GPU 计算
+    )
+    print("模型加载完成！")
+    return model
+
 @solara.component
 def ImageToKnowledgeGraph():
     """
@@ -192,6 +178,8 @@ def ImageToKnowledgeGraph():
     error_message = solara.use_reactive("")
     debug_message = solara.use_reactive("")
 
+    model = load_model()
+
     def process_pipeline():
         debug_info = ""
         error_message.value = ""
@@ -202,28 +190,30 @@ def ImageToKnowledgeGraph():
             return
 
         debug_info += "开始处理流程。\n"
+        print("开始处理流程。")
         try:
             # 1) 生成图片描述
-            caption = generate_caption(uploaded_image.value)
-            if not caption or len(caption.strip()) < 20:
-                debug_info += "生成的图片描述较短，使用备用描述。\n"
-                caption = fallback_caption
-            else:
-                debug_info += "生成图片描述成功。\n"
+            caption = generate_caption(uploaded_image.value, model)
+            debug_info += "生成图片描述成功。\n"
+            print("生成图片描述成功。")
+            print(caption)
             caption_text.value = caption
 
             # 2) 生成知识图谱
             kg = generate_kg(caption_text.value)
             kg_result.value = kg
             debug_info += "生成知识图谱成功。\n"
+            print("生成知识图谱成功。")
 
         except Exception as e:
             error_message.value = f"执行流程时出错: {e}"
             debug_info += f"执行流程异常: {e}\n"
+            print(f"执行流程异常: {e}")
 
         debug_info += "流程处理完毕。"
+        print("流程处理完毕。")
         debug_message.value = debug_info
-        print(debug_info)
+        # print(debug_info)
 
     # ========== 前端UI ==========
     solara.Markdown("### 上传图片")
@@ -279,4 +269,14 @@ def Page():
     solara.Markdown("上传图片后，系统将先通过视觉模型生成图片描述，再根据描述生成知识图谱。")
     ImageToKnowledgeGraph()
 
-Page()
+
+
+
+
+
+
+def main():
+    Page()
+
+if __name__ == "__main__":
+    main()
